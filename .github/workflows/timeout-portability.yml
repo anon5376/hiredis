@@ -6,31 +6,44 @@ permissions:
   contents: read
 jobs:
   paired-regressions:
+    name: ${{ matrix.os }} libevent=${{ matrix.libevent }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - {os: ubuntu-latest, libevent: 'OFF'}
+          - {os: macos-latest, libevent: 'OFF'}
+          - {os: windows-latest, libevent: 'OFF'}
+          - {os: ubuntu-latest, libevent: 'ON'}
+          - {os: macos-latest, libevent: 'ON'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Install existing optional libevent test dependency (Linux)
+        if: matrix.libevent == 'ON' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev pkg-config
+      - name: Install existing optional libevent test dependency (macOS)
+        if: matrix.libevent == 'ON' && runner.os == 'macOS'
+        run: |
+          brew install libevent
+          echo "PKG_CONFIG_PATH=$(brew --prefix libevent)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Build patch
-        run: cmake -S ci -B build-fixed -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S ci -B build-fixed -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DTIMEOUT_TEST_LIBEVENT=${{ matrix.libevent }}
       - run: cmake --build build-fixed --config Release --parallel 4
-      - name: Require both patched cases to pass
+      - name: Require all patched cases to pass
         run: ctest --test-dir build-fixed -C Release --output-on-failure
-      - name: Restore only the original command implementation
+      - name: Restore the original command implementation
         shell: python
         run: |
           import pathlib, subprocess
-          baseline = subprocess.check_output(['git', 'show', '058ebcdf36c5b05b759c613564fb958ec363c90f:async.c'])
-          pathlib.Path('async.c').write_bytes(baseline)
-      - name: Build baseline with the same regression source
-        run: cmake -S ci -B build-before -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+          pathlib.Path('async.c').write_bytes(subprocess.check_output(['git', 'show', '058ebcdf36c5b05b759c613564fb958ec363c90f:async.c']))
+      - name: Build original baseline with the same regression source
+        run: cmake -S ci -B build-before -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DTIMEOUT_TEST_LIBEVENT=${{ matrix.libevent }}
       - run: cmake --build build-before --config Release --parallel 4
-      - name: Require both baseline cases to fail
+      - name: Require original enqueue failures and runtime controls
         shell: python
         run: |
           import re, subprocess
@@ -40,3 +53,30 @@ jobs:
           assert result.returncode == 8, result.returncode
           assert 'Async command enqueue does not postpone a stalled connection timeout: FAILED' in output
           assert 'Async timeout is armed for new commands after an idle period: FAILED' in output
+          assert 'Async timeout can be enabled while commands are pending: PASSED' in output
+          assert 'Async timeout can be shortened while commands are pending: PASSED' in output
+          if '${{ matrix.libevent }}' == 'ON':
+              assert 'Libevent write interest does not postpone a pending timeout: FAILED' in output
+      - name: Restore the previous PR implementation and adapter
+        shell: python
+        run: |
+          import pathlib, subprocess
+          for name in ('async.c', 'adapters/libevent.h'):
+              pathlib.Path(name).write_bytes(subprocess.check_output(['git', 'show', 'c4399445d86de001cbc1adc50782b3fb5c918736:' + name]))
+      - name: Build previous PR with the same regression source
+        run: cmake -S ci -B build-previous -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DTIMEOUT_TEST_LIBEVENT=${{ matrix.libevent }}
+      - run: cmake --build build-previous --config Release --parallel 4
+      - name: Require reported PR regressions and original controls
+        shell: python
+        run: |
+          import re, subprocess
+          result = subprocess.run(['ctest', '--test-dir', 'build-previous', '-C', 'Release', '--output-on-failure'], capture_output=True, text=True)
+          output = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout + result.stderr)
+          print(output)
+          assert result.returncode == 8, result.returncode
+          assert 'Async command enqueue does not postpone a stalled connection timeout: PASSED' in output
+          assert 'Async timeout is armed for new commands after an idle period: PASSED' in output
+          assert 'Async timeout can be enabled while commands are pending: FAILED' in output
+          assert 'Async timeout can be shortened while commands are pending: FAILED' in output
+          if '${{ matrix.libevent }}' == 'ON':
+              assert 'Libevent write interest does not postpone a pending timeout: FAILED' in output
