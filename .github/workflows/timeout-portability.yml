@@ -1,0 +1,42 @@
+name: Timeout portability
+on:
+  push:
+    branches: [codex/async-timeout-ci]
+permissions:
+  contents: read
+jobs:
+  paired-regressions:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build patch
+        run: cmake -S ci -B build-fixed -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-fixed --config Release --parallel 4
+      - name: Require both patched cases to pass
+        run: ctest --test-dir build-fixed -C Release --output-on-failure
+      - name: Restore only the original command implementation
+        shell: python
+        run: |
+          import pathlib, subprocess
+          baseline = subprocess.check_output(['git', 'show', '058ebcdf36c5b05b759c613564fb958ec363c90f:async.c'])
+          pathlib.Path('async.c').write_bytes(baseline)
+      - name: Build baseline with the same regression source
+        run: cmake -S ci -B build-before -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-before --config Release --parallel 4
+      - name: Require both baseline cases to fail
+        shell: python
+        run: |
+          import re, subprocess
+          result = subprocess.run(['ctest', '--test-dir', 'build-before', '-C', 'Release', '--output-on-failure'], capture_output=True, text=True)
+          output = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout + result.stderr)
+          print(output)
+          assert result.returncode == 8, result.returncode
+          assert 'Async command enqueue does not postpone a stalled connection timeout: FAILED' in output
+          assert 'Async timeout is armed for new commands after an idle period: FAILED' in output
